@@ -6,7 +6,7 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { AfterimagePass } from 'three/addons/postprocessing/AfterimagePass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
-const API_BASE = 'http://localhost:8000/api';
+const API_BASE = 'https://uie47061-diffhedge.hf.space/api';
 
 // Non-reactive provider storage to avoid Proxy issues with Wallet extensions
 let currentProvider = null;
@@ -48,6 +48,7 @@ const pendingOption = ref(null);
 const showMenu = ref(false);
 const showHistoryOverlay = ref(false);
 const showUserOverlay = ref(false);
+const isConnecting = ref(false);
 const currentBlockHeight = ref(84021);
 const userHistory = ref([]);
 
@@ -62,11 +63,12 @@ const resultData = ref({
 // Helper to log messages
 const log = (msg) => {
   const timestamp = new Date().toLocaleTimeString();
-  currentContract.logs.unshift(`[${timestamp}] ${msg}`);
+  console.log(`[${timestamp}] ${msg}`);
 };
 
 // Connect Wallet
 const connectWallet = async () => {
+  isConnecting.value = true;
   try {
     let provider = null;
     let name = '';
@@ -92,6 +94,7 @@ const connectWallet = async () => {
       }
     } else {
       alert('Please install OKX Wallet or UniSat Wallet!');
+      isConnecting.value = false;
       return;
     }
 
@@ -110,11 +113,10 @@ const connectWallet = async () => {
     }
 
     fetchStats();
-    
-    // Close user overlay after successful connection
-    closeUserProfile();
   } catch (e) {
     log(`Connection failed: ${e.message}`);
+  } finally {
+    isConnecting.value = false;
   }
 };
 
@@ -630,7 +632,7 @@ onMounted(() => {
   animate();
   
   // WebSocket Setup
-  const ws = new WebSocket('ws://localhost:8000/ws');
+  const ws = new WebSocket('wss://uie47061-diffhedge.hf.space/ws');
   
   ws.onopen = () => {
     log('[WS] WebSocket connected');
@@ -716,15 +718,6 @@ onBeforeUnmount(() => {
                 <path d="M3 3h7l1 2h10l-2 10H3z"></path>
               </svg>
               History
-            </div>
-            <div v-if="currentContract.logs.length > 0" class="menu-item" @click="showMenu = false;">
-              <svg class="menu-icon" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                <polyline points="14 2 14 8 20 8"></polyline>
-                <line x1="12" y1="18" x2="12" y2="12"></line>
-                <line x1="9" y1="15" x2="15" y2="15"></line>
-              </svg>
-              Logs ({{ currentContract.logs.length }})
             </div>
           </div>
         </div>
@@ -896,7 +889,12 @@ onBeforeUnmount(() => {
         </div>
         
         <div class="profile-content">
-          <div v-if="!wallet.connected" class="not-connected">
+          <div v-if="isConnecting" class="connecting-state">
+            <div class="spinner"></div>
+            <p>Connecting wallet...</p>
+          </div>
+          
+          <div v-else-if="!wallet.connected" class="not-connected">
             <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity: 0.3; margin-bottom: 15px;">
               <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
               <circle cx="12" cy="7" r="4"></circle>
@@ -1699,14 +1697,48 @@ h2 {
   padding: 25px;
 }
 
+.connecting-state {
+  text-align: center;
+  padding: 40px 20px;
+  color: #888;
+}
+
+.connecting-state p {
+  margin-top: 20px;
+  color: #aaa;
+}
+
+.spinner {
+  width: 50px;
+  height: 50px;
+  margin: 0 auto;
+  border: 4px solid rgba(66, 184, 131, 0.2);
+  border-top: 4px solid #42b883;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
 .not-connected {
   text-align: center;
   padding: 20px 0;
   color: #888;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 
 .not-connected p {
   margin-bottom: 20px;
+}
+
+.not-connected .btn {
+  width: auto;
+  min-width: 200px;
 }
 
 .wallet-details {
