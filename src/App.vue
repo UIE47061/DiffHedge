@@ -159,7 +159,8 @@ const openHistory = async () => {
         won: contract.result === 'WIN',
         collected: contract.collected || false,
         timestamp: new Date(contract.created_at).getTime(),
-        contractAddress: contract.multisig_address
+        contractAddress: contract.multisig_address,
+        txHex: contract.tx_hex || ''
       }));
       
       log(`Loaded ${data.count} contracts from history`);
@@ -397,6 +398,32 @@ const checkStatus = async () => {
     log(`Contract status: ${JSON.stringify(data)}`);
   } catch (e) {
     log(`Status check failed: ${e.message}`);
+  }
+};
+
+// Sign and Broadcast Transaction
+const signAndBroadcast = async (contractId, txHex) => {
+  if (!txHex) return alert('No transaction to sign');
+  
+  try {
+    log('正在請求錢包簽名...');
+    
+    console.log("Partial TX Hex:", txHex);
+    
+    if (wallet.name.includes('UniSat')) {
+      try {
+        alert("請複製 Console 中的 Hex，使用支援 Raw Taproot 簽名的工具完成簽名並廣播。");
+      } catch (e) {
+        log("簽名請求失敗: " + e.message);
+      }
+    } else {
+      alert("請複製 Console 中的 Hex，使用支援 Raw Taproot 簽名的工具完成簽名並廣播。");
+    }
+    
+    log(`待簽名 Hex 已輸出至 Console`);
+    
+  } catch (e) {
+    log(`操作失敗: ${e.message}`);
   }
 };
 
@@ -900,6 +927,13 @@ onBeforeUnmount(() => {
                 @click="collectWinnings(game.id)"
               >
                 Collect
+              </button>
+              <button 
+                v-else-if="game.status === 'WAITING_USER_SIG' || game.status === 'WAITING_USER_SIG_REFUND'"
+                class="btn-sign"
+                @click="signAndBroadcast(game.id, game.txHex)"
+              >
+                Sign
               </button>
               <span v-else-if="game.collected" class="status-collected">COLLECTED</span>
               <span v-else class="status-pending">{{ game.status }}</span>
@@ -1648,6 +1682,23 @@ h2 {
 
 .btn-collect:hover {
   background: #3aa876;
+}
+
+.btn-sign {
+  background: rgba(255, 193, 7, 0.2);
+  color: #ffc107;
+  border: 1px solid #ffc107;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.8rem;
+  transition: all 0.2s;
+}
+
+.btn-sign:hover {
+  background: #ffc107;
+  color: #000;
 }
 
 .btn-collect-all {
