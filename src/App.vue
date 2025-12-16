@@ -1,11 +1,41 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue';
+import { ref, reactive, onMounted, onBeforeUnmount } from 'vue';
 import * as THREE from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { AfterimagePass } from 'three/addons/postprocessing/AfterimagePass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
+const API_BASE = 'http://localhost:8000/api';
+
+// Non-reactive provider storage to avoid Proxy issues with Wallet extensions
+let currentProvider = null;
+
+// Wallet State
+const wallet = reactive({
+  connected: false,
+  address: '',
+  publicKey: '',
+  name: ''
+});
+
+// API Stats
+const stats = reactive({
+  difficulty: 0,
+  hashprice: 0,
+  houseAddress: ''
+});
+
+// Current Contract State
+const currentContract = reactive({
+  id: null,
+  address: '',
+  status: '',
+  tx_hex: '',
+  logs: []
+});
+
+// UI State
 const sceneContainer = ref(null);
 const timeSinceLastBlock = ref('0s');
 const difficulty = ref(100);
@@ -15,6 +45,12 @@ const showResultOverlay = ref(false);
 const showBettingModal = ref(false);
 const betAmount = ref(1000);
 const pendingOption = ref(null);
+const showMenu = ref(false);
+const showHistoryOverlay = ref(false);
+const showUserOverlay = ref(false);
+const currentBlockHeight = ref(84021);
+const userHistory = ref([]);
+
 const resultData = ref({
   bet: '',
   amount: 0,
@@ -23,46 +59,231 @@ const resultData = ref({
   won: false
 });
 
+// Helper to log messages
+const log = (msg) => {
+  const timestamp = new Date().toLocaleTimeString();
+  currentContract.logs.unshift(`[${timestamp}] ${msg}`);
+};
+
+// Connect Wallet
+const connectWallet = async () => {
+  try {
+    let provider = null;
+    let name = '';
+
+    if (typeof window.unisat !== 'undefined') {
+      provider = window.unisat;
+      name = 'UniSat Wallet';
+      try {
+        const net = await provider.getNetwork();
+        if (net !== 'testnet') {
+          await provider.switchNetwork("testnet");
+        }
+      } catch (e) {
+        log("切換網路失敗 (UniSat): " + e.message);
+      }
+    } else if (typeof window.okxwallet !== 'undefined' && window.okxwallet.bitcoin) {
+      provider = window.okxwallet.bitcoin;
+      name = 'OKX Wallet';
+      try {
+        await provider.switchNetwork("testnet");
+      } catch (e) {
+        log("切換網路失敗 (OKX): " + e.message);
+      }
+    } else {
+      alert('Please install OKX Wallet or UniSat Wallet!');
+      return;
+    }
+
+    const accounts = await provider.requestAccounts();
+    wallet.address = accounts[0];
+    wallet.publicKey = await provider.getPublicKey();
+    currentProvider = provider;
+    wallet.name = name;
+    wallet.connected = true;
+    
+    log(`Connected ${name}: ${wallet.address}`);
+
+    if (wallet.address.startsWith('bc1')) {
+      log("⚠️ Warning: Detected Mainnet address! Please manually switch wallet to Testnet/Signet");
+      alert("You seem to be connected to Bitcoin Mainnet. This app only runs on Signet testnet. Please switch network in wallet settings.");
+    }
+
+    fetchStats();
+    
+    // Close user overlay after successful connection
+    closeUserProfile();
+  } catch (e) {
+    log(`Connection failed: ${e.message}`);
+  }
+};
+
+// Fetch Stats from API
+const fetchStats = async () => {
+  try {
+    const res = await fetch(`${API_BASE}/stats`);
+    const data = await res.json();
+    stats.difficulty = data.difficulty;
+    stats.hashprice = data.hashprice_sats;
+    stats.houseAddress = data.house_address;
+    difficulty.value = stats.difficulty;
+    log('System stats updated');
+  } catch (e) {
+    log(`Failed to fetch stats: ${e.message}`);
+  }
+};
+
+const toggleMenu = () => {
+  showMenu.value = !showMenu.value;
+};
+
+const openHistory = () => {
+  showMenu.value = false;
+  showHistoryOverlay.value = true;
+};
+
+const closeHistory = () => {
+  showHistoryOverlay.value = false;
+};
+
+const openUserProfile = () => {
+  showMenu.value = false;
+  showUserOverlay.value = true;
+};
+
+const closeUserProfile = () => {
+  showUserOverlay.value = false;
+};
+
+const disconnectWallet = () => {
+  wallet.connected = false;
+  wallet.address = '';
+  wallet.publicKey = '';
+  wallet.name = '';
+  currentProvider = null;
+  showUserOverlay.value = false;
+  log('Wallet disconnected');
+};
+
+const collectWinnings = (gameId) => {
+  const game = userHistory.value.find(g => g.id === gameId);
+  if (game && game.won && !game.collected) {
+    game.collected = true;
+  }
+};
+
+const collectAll = () => {
+  userHistory.value.forEach(game => {
+    if (game.won && !game.collected) {
+      game.collected = true;
+    }
+  });
+};
+
 const handleOptionClick = (type) => {
-  if (isMining.value) return;
+  if (isMining.value || !wallet.connected) {
+    if (!wallet.connected) {
+      alert('Please connect wallet first!');
+    }
+    return;
+  }
   pendingOption.value = type;
   showBettingModal.value = true;
 };
 
-const submitBet = () => {
+const submitBet = async () => {
   if (betAmount.value < 1000) {
     alert('Minimum bet is 1000 sats');
     return;
   }
   
+  if (!wallet.connected) {
+    alert('Please connect wallet first!');
+    return;
+  }
+
   showBettingModal.value = false;
   isMining.value = true;
   selectedOption.value = pendingOption.value;
 
-  // Simulate waiting for result
-  setTimeout(() => {
-    // Randomly determine the next difficulty change
-    // 50% chance to increase, 50% to decrease
-    let change = Math.random() > 0.5 ? 10 : -10;
+  try {
+    // Step 1: Create Contract
+    log('Creating contract...');
+    const direction = selectedOption.value === 'increase' ? 'LONG' : 'SHORT';
+    const res = await fetch(`${API_BASE}/create_contract`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        user_pubkey: wallet.publicKey,
+        amount: betAmount.value,
+        direction: direction
+      })
+    });
+    const data = await res.json();
     
-    // Boundary check: If difficulty is 0, force increase
-    if (difficulty.value === 0 && change < 0) {
-        change = 10;
+    if (data.status !== 'success') {
+      log(`Contract creation failed: ${JSON.stringify(data)}`);
+      isMining.value = false;
+      selectedOption.value = null;
+      return;
     }
 
-    const newDiff = difficulty.value + change;
-    const won = (change > 0 && selectedOption.value === 'increase') || (change < 0 && selectedOption.value === 'decrease');
+    currentContract.id = data.contract_id;
+    currentContract.address = data.deposit_address;
+    currentContract.status = 'CREATED';
+    log(`Contract created! ID: ${data.contract_id}`);
+    log(`Deposit address: ${data.deposit_address}`);
 
-    resultData.value = {
-      bet: selectedOption.value === 'increase' ? 'Long (INCREASE)' : 'Short (DECREASE)',
-      amount: betAmount.value,
-      prevDiff: difficulty.value,
-      newDiff: newDiff,
-      won: won
-    };
-    
-    showResultOverlay.value = true;
-  }, 5000);
+    // Step 2: Deposit (Sign & Send)
+    log(`Calling wallet to send ${betAmount.value} sats...`);
+    const txid = await currentProvider.sendBitcoin(currentContract.address, parseInt(betAmount.value), {feeRate: 1.5});
+    log(`Deposit transaction broadcasted! TXID: ${txid}`);
+
+    // Step 3: Auto Match (Wait 3s for propagation)
+    log('Waiting for transaction propagation, then auto-matching (3s)...');
+    setTimeout(async () => {
+      await matchContract();
+    }, 3000);
+
+  } catch (e) {
+    log(`Error: ${e.message}`);
+    if (currentContract.id) {
+      log('Transaction failed, cleaning up contract...');
+      try {
+        await fetch(`${API_BASE}/cancel_contract`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contract_id: currentContract.id })
+        });
+        log(`Contract ID ${currentContract.id} cancelled`);
+      } catch (cleanupError) {
+        log(`Cleanup failed: ${cleanupError.message}`);
+      }
+      currentContract.id = null;
+      currentContract.address = '';
+      currentContract.status = '';
+    }
+    isMining.value = false;
+    selectedOption.value = null;
+  }
+};
+
+// Match Contract (House Deposit)
+const matchContract = async () => {
+  if (!currentContract.id) return;
+  
+  try {
+    log('Requesting house to match...');
+    const res = await fetch(`${API_BASE}/match`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contract_id: currentContract.id })
+    });
+    const data = await res.json();
+    log(`Match result: ${JSON.stringify(data)}`);
+  } catch (e) {
+    log(`Match request error: ${e.message}`);
+  }
 };
 
 const cancelBet = () => {
@@ -73,15 +294,83 @@ const cancelBet = () => {
 const confirmResult = () => {
   showResultOverlay.value = false;
   
+  // Add to history
+  userHistory.value.unshift({
+    id: currentContract.id || Date.now(),
+    blockHeight: currentBlockHeight.value,
+    bet: resultData.value.bet,
+    amount: resultData.value.amount,
+    won: resultData.value.won,
+    collected: false,
+    timestamp: Date.now()
+  });
+
   // Apply the calculated difficulty
   difficulty.value = resultData.value.newDiff;
 
   // Execute 3D transition
   transitionToNextBlock();
+  
+  // Increment block height
+  currentBlockHeight.value++;
 
   // Reset UI state
   selectedOption.value = null;
   isMining.value = false;
+  
+  // Reset contract state
+  currentContract.id = null;
+  currentContract.address = '';
+  currentContract.status = '';
+  currentContract.tx_hex = '';
+};
+
+// Settle All Contracts
+const settleAllContracts = async () => {
+  try {
+    log(`Requesting batch settlement (difficulty: ${stats.difficulty})...`);
+    const res = await fetch(`${API_BASE}/settle_all`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        current_difficulty: stats.difficulty
+      })
+    });
+    const data = await res.json();
+    log(`Batch settlement result: ${JSON.stringify(data)}`);
+  } catch (e) {
+    log(`Settlement request error: ${e.message}`);
+  }
+};
+
+// Refund Contract
+const refundContract = async () => {
+  if (!currentContract.id) return;
+  
+  try {
+    log('Requesting refund...');
+    const res = await fetch(`${API_BASE}/refund`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contract_id: currentContract.id })
+    });
+    const data = await res.json();
+    log(`Refund result: ${JSON.stringify(data)}`);
+  } catch (e) {
+    log(`Refund request error: ${e.message}`);
+  }
+};
+
+// Check Contract Status
+const checkStatus = async () => {
+  if (!currentContract.id) return;
+  try {
+    const res = await fetch(`${API_BASE}/contract/${currentContract.id}`);
+    const data = await res.json();
+    log(`Contract status: ${JSON.stringify(data)}`);
+  } catch (e) {
+    log(`Status check failed: ${e.message}`);
+  }
 };
 
 const transitionToNextBlock = () => {
@@ -339,6 +628,52 @@ const animate = () => {
 onMounted(() => {
   initThreeJS();
   animate();
+  
+  // WebSocket Setup
+  const ws = new WebSocket('ws://localhost:8000/ws');
+  
+  ws.onopen = () => {
+    log('[WS] WebSocket connected');
+  };
+  
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    log(`[WS] Notification: ${data.type} - ID: ${data.contract_id}`);
+    
+    // If this is our current contract, update state
+    if (currentContract.id && data.contract_id === currentContract.id) {
+      if (data.type === 'MATCHED') {
+        currentContract.status = 'MATCHED';
+        log('House matched! Contract active.');
+      } else if (data.type === 'SETTLED') {
+        currentContract.status = data.result;
+        log(`Contract settled: ${data.result}`);
+        
+        // Show result overlay
+        const won = (data.result === 'WIN');
+        resultData.value = {
+          bet: selectedOption.value === 'increase' ? 'Long (INCREASE)' : 'Short (DECREASE)',
+          amount: betAmount.value,
+          prevDiff: difficulty.value,
+          newDiff: data.new_difficulty || difficulty.value,
+          won: won
+        };
+        
+        // Stop mining animation
+        isMining.value = false;
+        showResultOverlay.value = true;
+        
+      } else if (data.type === 'ACTION_REQUIRED') {
+        currentContract.status = data.status;
+        currentContract.tx_hex = data.tx_hex;
+        log(`[Action Required] ${data.message}`);
+      }
+    }
+  };
+  
+  ws.onerror = (error) => {
+    console.error('WebSocket Error:', error);
+  };
 });
 
 onBeforeUnmount(() => {
@@ -359,11 +694,39 @@ onBeforeUnmount(() => {
         <span class="brand-name">DiffHedge</span>
       </div>
       <div class="nav-right">
-        <div class="user-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
-            <circle cx="12" cy="7" r="4"></circle>
-          </svg>
+        <div class="menu-container">
+          <div class="hamburger-icon" @click="toggleMenu">
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="3" y1="12" x2="21" y2="12"></line>
+              <line x1="3" y1="6" x2="21" y2="6"></line>
+              <line x1="3" y1="18" x2="21" y2="18"></line>
+            </svg>
+          </div>
+          
+          <div v-if="showMenu" class="dropdown-menu">
+            <div class="menu-item" @click="openUserProfile">
+              <svg class="menu-icon" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+              </svg>
+              User
+            </div>
+            <div class="menu-item" @click="openHistory">
+              <svg class="menu-icon" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 3h7l1 2h10l-2 10H3z"></path>
+              </svg>
+              History
+            </div>
+            <div v-if="currentContract.logs.length > 0" class="menu-item" @click="showMenu = false;">
+              <svg class="menu-icon" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="12" y1="18" x2="12" y2="12"></line>
+                <line x1="9" y1="15" x2="15" y2="15"></line>
+              </svg>
+              Logs ({{ currentContract.logs.length }})
+            </div>
+          </div>
         </div>
       </div>
     </nav>
@@ -384,15 +747,19 @@ onBeforeUnmount(() => {
           <div class="card-body">
             <div class="info-row">
               <span class="label">DIFFICULTY</span>
-              <span class="value glow-text">{{ difficulty }}</span>
+              <span class="value glow-text">{{ stats.difficulty || difficulty }}</span>
             </div>
             <div class="info-row">
-              <span class="label">PREV DIFFICULTY</span>
-              <span class="value">90</span>
+              <span class="label">HASHPRICE</span>
+              <span class="value">{{ stats.hashprice }} sats</span>
             </div>
             <div class="info-row">
               <span class="label">LAST BLOCK</span>
               <span class="value time-value">{{ timeSinceLastBlock }}</span>
+            </div>
+            <div v-if="currentContract.status" class="info-row">
+              <span class="label">CONTRACT</span>
+              <span class="value" :class="'status-' + currentContract.status.toLowerCase()">{{ currentContract.status }}</span>
             </div>
           </div>
 
@@ -475,6 +842,95 @@ onBeforeUnmount(() => {
         </div>
 
         <button class="btn btn-confirm" @click="confirmResult">Confirm</button>
+      </div>
+    </div>
+
+    <!-- History Overlay -->
+    <div v-if="showHistoryOverlay" class="overlay history-overlay-wrapper">
+      <div class="overlay-content history-modal">
+        <div class="history-header">
+          <h3>Betting History</h3>
+          <div class="header-actions">
+            <button class="btn-collect-all" @click="collectAll">Collect All</button>
+            <button class="btn-close" @click="closeHistory">×</button>
+          </div>
+        </div>
+        
+        <div class="history-list">
+          <div v-if="userHistory.length === 0" class="no-history">
+            No betting history yet.
+          </div>
+          <div v-for="game in userHistory" :key="game.id" class="history-item" :class="{ 'won': game.won, 'lost': !game.won }">
+            <div class="history-info">
+              <div class="history-row">
+                <span class="block-num">Block #{{ game.blockHeight }}</span>
+                <span class="bet-time">{{ new Date(game.timestamp).toLocaleTimeString() }}</span>
+              </div>
+              <div class="history-row">
+                <span class="bet-type">{{ game.bet }}</span>
+                <span class="bet-amount">{{ game.amount }} sats</span>
+              </div>
+            </div>
+            <div class="history-action">
+              <span v-if="!game.won" class="status-lost">LOSS</span>
+              <button 
+                v-else-if="!game.collected" 
+                class="btn-collect" 
+                @click="collectWinnings(game.id)"
+              >
+                Collect
+              </button>
+              <span v-else class="status-collected">COLLECTED</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- User Profile Overlay -->
+    <div v-if="showUserOverlay" class="overlay">
+      <div class="overlay-content user-profile-modal">
+        <div class="profile-header">
+          <h3>User Profile</h3>
+          <button class="btn-close" @click="closeUserProfile">×</button>
+        </div>
+        
+        <div class="profile-content">
+          <div v-if="!wallet.connected" class="not-connected">
+            <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity: 0.3; margin-bottom: 15px;">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+              <circle cx="12" cy="7" r="4"></circle>
+            </svg>
+            <p>No wallet connected</p>
+            <button class="btn btn-confirm" @click="connectWallet">Connect Wallet</button>
+          </div>
+          
+          <div v-else class="wallet-details">
+            <div class="wallet-info-row">
+              <span class="info-label">Wallet</span>
+              <span class="info-value">{{ wallet.name }}</span>
+            </div>
+            <div class="wallet-info-row">
+              <span class="info-label">Address</span>
+              <span class="info-value mono">{{ wallet.address }}</span>
+            </div>
+            <div class="wallet-info-row">
+              <span class="info-label">Public Key</span>
+              <span class="info-value mono small">{{ wallet.publicKey.substring(0, 32) }}...</span>
+            </div>
+            
+            <div class="profile-actions">
+              <button class="btn btn-disconnect" @click="disconnectWallet">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                  <polyline points="16 17 21 12 16 7"></polyline>
+                  <line x1="21" y1="12" x2="9" y2="12"></line>
+                </svg>
+                Disconnect
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -978,4 +1434,354 @@ h2 {
 .btn-decrease:active {
   transform: translateY(0);
 }
+
+/* --- Menu & History Styles --- */
+.menu-container {
+  position: relative;
+}
+
+.hamburger-icon {
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 50%;
+  transition: background 0.3s;
+  color: #fff;
+}
+
+.hamburger-icon:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.dropdown-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 10px;
+  width: 180px;
+  background: rgba(30, 30, 30, 0.95);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  overflow: hidden;
+  z-index: 1000;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+  padding: 8px 0;
+}
+
+.menu-item {
+  padding: 12px 15px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #ccc;
+  transition: background 0.2s;
+  font-size: 0.9rem;
+}
+
+.menu-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+}
+
+.menu-icon {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.history-modal {
+  width: 500px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.history-header {
+  padding: 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.history-header h3 {
+  margin: 0;
+  color: #fff;
+}
+
+.header-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.btn-close {
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 1.5rem;
+  cursor: pointer;
+  padding: 0 5px;
+}
+
+.btn-close:hover {
+  color: #fff;
+}
+
+.history-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.no-history {
+  padding: 30px;
+  text-align: center;
+  color: #666;
+}
+
+.history-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 15px;
+  margin-bottom: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  border-left: 3px solid transparent;
+}
+
+.history-item.won {
+  border-left-color: #42b883;
+}
+
+.history-item.lost {
+  border-left-color: #eb4d4b;
+}
+
+.history-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.history-row {
+  display: flex;
+  gap: 15px;
+  font-size: 0.9rem;
+}
+
+.block-num {
+  color: #888;
+  font-family: monospace;
+}
+
+.bet-time {
+  color: #666;
+  font-size: 0.8rem;
+}
+
+.bet-type {
+  font-weight: 600;
+  color: #ddd;
+}
+
+.bet-amount {
+  color: #aaa;
+}
+
+.btn-collect {
+  background: #42b883;
+  color: #fff;
+  border: none;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.8rem;
+  transition: background 0.2s;
+}
+
+.btn-collect:hover {
+  background: #3aa876;
+}
+
+.btn-collect-all {
+  background: rgba(66, 184, 131, 0.2);
+  color: #42b883;
+  border: 1px solid #42b883;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  transition: all 0.2s;
+}
+
+.btn-collect-all:hover {
+  background: #42b883;
+  color: #fff;
+}
+
+.status-lost {
+  color: #eb4d4b;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.status-collected {
+  color: #42b883;
+  font-size: 0.8rem;
+  font-weight: 600;
+  opacity: 0.7;
+}
+
+/* Wallet Info Styles */
+.user-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wallet-name {
+  font-weight: 600;
+  color: #fff;
+  font-size: 0.9rem;
+}
+
+.wallet-address {
+  font-size: 0.75rem;
+  color: #888;
+  font-family: monospace;
+}
+
+/* Contract Status Colors */
+.status-created {
+  color: #ffc107;
+}
+
+.status-matched {
+  color: #42b883;
+}
+
+.status-settled {
+  color: #17a2b8;
+}
+
+.status-waiting_user_sig,
+.status-waiting_user_sig_refund {
+  color: #dc3545;
+  animation: pulse 1s infinite;
+}
+
+/* User Profile Overlay */
+.user-profile-modal {
+  width: 450px;
+  padding: 0;
+  overflow: hidden;
+}
+
+.profile-header {
+  padding: 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.profile-header h3 {
+  margin: 0;
+  color: #fff;
+}
+
+.profile-content {
+  padding: 25px;
+}
+
+.not-connected {
+  text-align: center;
+  padding: 20px 0;
+  color: #888;
+}
+
+.not-connected p {
+  margin-bottom: 20px;
+}
+
+.wallet-details {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.wallet-info-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-bottom: 15px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.wallet-info-row:last-of-type {
+  border-bottom: none;
+}
+
+.info-label {
+  font-size: 0.8rem;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.info-value {
+  font-size: 0.95rem;
+  color: #fff;
+  word-break: break-all;
+}
+
+.info-value.mono {
+  font-family: 'Courier New', monospace;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+.info-value.small {
+  font-size: 0.8rem;
+}
+
+.profile-actions {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.btn-disconnect {
+  width: 100%;
+  background: rgba(235, 77, 75, 0.2);
+  border: 1px solid rgba(235, 77, 75, 0.4);
+  color: #eb4d4b;
+  padding: 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.3s;
+}
+
+.btn-disconnect:hover {
+  background: rgba(235, 77, 75, 0.3);
+  border-color: rgba(235, 77, 75, 0.6);
+}
+
+.btn-disconnect svg {
+  flex-shrink: 0;
+}
 </style>
+
