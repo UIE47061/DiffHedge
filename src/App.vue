@@ -139,9 +139,34 @@ const toggleMenu = () => {
   showMenu.value = !showMenu.value;
 };
 
-const openHistory = () => {
+const openHistory = async () => {
   showMenu.value = false;
   showHistoryOverlay.value = true;
+  
+  // Fetch user contracts from API
+  if (wallet.connected && wallet.publicKey) {
+    try {
+      const res = await fetch(`${API_BASE}/contracts/user/${wallet.publicKey}`);
+      const data = await res.json();
+      
+      // Transform API data to match UI format
+      userHistory.value = data.contracts.map(contract => ({
+        id: contract.id,
+        blockHeight: contract.block_height || currentBlockHeight.value,
+        bet: contract.direction === 'LONG' ? 'Long (INCREASE)' : 'Short (DECREASE)',
+        amount: contract.amount,
+        status: contract.status,
+        won: contract.result === 'WIN',
+        collected: contract.collected || false,
+        timestamp: new Date(contract.created_at).getTime(),
+        contractAddress: contract.multisig_address
+      }));
+      
+      log(`Loaded ${data.count} contracts from history`);
+    } catch (e) {
+      log(`Failed to load history: ${e.message}`);
+    }
+  }
 };
 
 const closeHistory = () => {
@@ -853,27 +878,31 @@ onBeforeUnmount(() => {
           <div v-if="userHistory.length === 0" class="no-history">
             No betting history yet.
           </div>
-          <div v-for="game in userHistory" :key="game.id" class="history-item" :class="{ 'won': game.won, 'lost': !game.won }">
+          <div v-for="game in userHistory" :key="game.id" class="history-item" :class="{ 'won': game.status === 'SETTLED' && game.won, 'lost': game.status === 'SETTLED' && !game.won }">
             <div class="history-info">
               <div class="history-row">
-                <span class="block-num">Block #{{ game.blockHeight }}</span>
-                <span class="bet-time">{{ new Date(game.timestamp).toLocaleTimeString() }}</span>
+                <span class="block-num">Contract #{{ game.id }}</span>
+                <span class="bet-time">{{ new Date(game.timestamp).toLocaleString() }}</span>
               </div>
               <div class="history-row">
                 <span class="bet-type">{{ game.bet }}</span>
                 <span class="bet-amount">{{ game.amount }} sats</span>
               </div>
+              <div class="history-row">
+                <span class="contract-status" :class="'status-' + game.status.toLowerCase()">{{ game.status }}</span>
+              </div>
             </div>
             <div class="history-action">
-              <span v-if="!game.won" class="status-lost">LOSS</span>
+              <span v-if="game.status === 'SETTLED' && !game.won" class="status-lost">LOSS</span>
               <button 
-                v-else-if="!game.collected" 
+                v-else-if="game.status === 'SETTLED' && game.won && !game.collected" 
                 class="btn-collect" 
                 @click="collectWinnings(game.id)"
               >
                 Collect
               </button>
-              <span v-else class="status-collected">COLLECTED</span>
+              <span v-else-if="game.collected" class="status-collected">COLLECTED</span>
+              <span v-else class="status-pending">{{ game.status }}</span>
             </div>
           </div>
         </div>
@@ -1588,6 +1617,21 @@ h2 {
 
 .bet-amount {
   color: #aaa;
+}
+
+.contract-status {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.status-pending {
+  color: #ffc107;
+  font-size: 0.8rem;
+  font-weight: 600;
 }
 
 .btn-collect {
